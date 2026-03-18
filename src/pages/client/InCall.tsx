@@ -17,6 +17,7 @@ interface AIAgent {
   voiceModel?: string;
   voiceSpeed?: number;
   voicePitch?: number;
+  greetingText?: string;
 }
 
 import { isAbortedError } from '../../lib/utils';
@@ -35,6 +36,7 @@ export default function InCall() {
   const [twilioDevice, setTwilioDevice] = useState<Device | null>(null);
   const twilioDeviceRef = useRef<Device | null>(null);
   const twilioCallRef = useRef<any>(null);
+  const twilioReadyRef = useRef<boolean>(false); // Twilio Device 是否已完成 register
   
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -84,6 +86,8 @@ export default function InCall() {
           device.destroy();
           return;
         }
+        twilioReadyRef.current = true;
+        console.log('Twilio Device registered and ready');
 
         if (!data.hasAppSid) {
           console.warn('Missing TWILIO_TWIML_APP_SID. Outgoing calls might fail.');
@@ -118,6 +122,9 @@ export default function InCall() {
   const isCallingRef = useRef(false);
   const isEndingRef = useRef(false);
   const isMountedRef = useRef(true);
+  const pendingTransferRef = useRef(false); // 等 AI 說完話後再轉接
+  const isGreetingRef = useRef(false); // 標記 AI 正在發送開頭語，此期間麥克風保持靜音
+  const sessionOpenedRef = useRef(false); // 標記 Gemini Live onopen 已觸發
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -185,9 +192,25 @@ export default function InCall() {
         }
 
         if (targetAgentId) {
-          const agentDoc = await getDoc(doc(db, 'agents', targetAgentId));
-          if (agentDoc.exists()) {
-            setAgent({ id: agentDoc.id, ...agentDoc.data() } as AIAgent);
+          // 使用後端 API 讀取 agent（繞過 Firestore 安全規則，訪客也可讀取）
+          try {
+            const agentRes = await fetch(`/api/agents/${targetAgentId}`);
+            if (agentRes.ok) {
+              const agentData = await agentRes.json();
+              setAgent(agentData as AIAgent);
+            } else {
+              // fallback: 嘗試直接從 Firebase 讀取
+              const agentDoc = await getDoc(doc(db, 'agents', targetAgentId));
+              if (agentDoc.exists()) {
+                setAgent({ id: agentDoc.id, ...agentDoc.data() } as AIAgent);
+              }
+            }
+          } catch (e) {
+            // fallback: 嘗試直接從 Firebase 讀取
+            const agentDoc = await getDoc(doc(db, 'agents', targetAgentId));
+            if (agentDoc.exists()) {
+              setAgent({ id: agentDoc.id, ...agentDoc.data() } as AIAgent);
+            }
           }
         }
 
@@ -242,6 +265,35 @@ export default function InCall() {
       setStatus('連接中');
       isCallingRef.current = true;
       
+      // iOS 需要在用戶手勢中預先建立 AudioContext，之後才能播放等候音樂
+      if (!holdAudioCtxRef.current || holdAudioCtxRef.current.state === 'closed') {
+        holdAudioCtxRef.current = new AudioContext();
+      }
+      if (holdAudioCtxRef.current.state === 'suspended') {
+        holdAudioCtxRef.current.resume().catch(() => {});
+      }
+
+      // iOS 相容性：如果 Twilio Device 尚未就緒，在用戶手勢中重新初始化
+      if (!twilioDeviceRef.current) {
+        console.log('Twilio Device not ready, re-initializing in user gesture...');
+        try {
+          const tokenRes = await fetch('/api/auth/twilio-token');
+          const tokenData = await tokenRes.json();
+          if (!tokenData.error) {
+            // 使用已静態 import 的 Device（避免重複動態 import）
+            const newDevice = new Device(tokenData.token, { logLevel: 1 });
+            twilioDeviceRef.current = newDevice;
+            setTwilioDevice(newDevice);
+            newDevice.register().then(() => {
+              twilioReadyRef.current = true;
+              console.log('Twilio Device re-registered in user gesture');
+            }).catch(e => console.warn('Twilio re-register failed:', e));
+          }
+        } catch (e) {
+          console.warn('Twilio re-init failed:', e);
+        }
+      }
+
       playerRef.current = new AudioPlayer();
       await playerRef.current.resume();
       
@@ -331,6 +383,7 @@ export default function InCall() {
               return;
             }
             console.log('Live API Connection Opened');
+            sessionOpenedRef.current = true; // 標記連線已開啟
             setStatus('通話中');
             isCallingRef.current = true;
             timerRef.current = window.setInterval(() => {
@@ -349,12 +402,16 @@ export default function InCall() {
             if (modelTurn && playerRef.current) {
               const audioPart = modelTurn.parts.find(p => p.inlineData?.data);
               if (audioPart && audioPart.inlineData?.data) {
+                // AI 開始說話，防止手機回音：停止收音
+                if (recorderRef.current) recorderRef.current.muteInput();
                 playerRef.current.playBase64(audioPart.inlineData.data);
               }
             }
             
             if (message.serverContent?.interrupted && playerRef.current) {
               playerRef.current.stop();
+              // 用戶打斷 AI，立即恢復收音
+              if (recorderRef.current) recorderRef.current.unmuteInput();
             }
 
             // 忽略 modelTurn 裡的 text (通常是 AI 的英文思考過程)，只使用語音的逐字稿 (outputTranscription)
@@ -378,21 +435,17 @@ export default function InCall() {
                   // 檢查整個最後一則訊息是否包含標籤 (防止標籤被切斷)
                   const fullText = last.text + outputTranscription;
                   if (fullText.includes('[TRANSFER_TO_HUMAN]')) {
-                    console.log('Web Call Transfer detected in full text');
-                    setTimeout(() => {
-                      setStatus('正在轉接專人...');
-                      handleWebTransfer();
-                    }, 500);
+                    console.log('Web Call Transfer detected in full text - waiting for AI to finish speaking');
+                    pendingTransferRef.current = true;
+                    setStatus('正在轉接專人...');
                   }
                   
                   return updatedMessages;
                 } else {
                   if (hasTransferTag) {
-                    console.log('Web Call Transfer detected in new chunk');
-                    setTimeout(() => {
-                      setStatus('正在轉接專人...');
-                      handleWebTransfer();
-                    }, 500);
+                    console.log('Web Call Transfer detected in new chunk - waiting for AI to finish speaking');
+                    pendingTransferRef.current = true;
+                    setStatus('正在轉接專人...');
                   }
                   return [...prev, { role: 'ai', text: cleanTranscription, time: getCurrentTimeStr(), isFinished: false }];
                 }
@@ -407,6 +460,41 @@ export default function InCall() {
                  }
                  return prev;
                });
+               // AI 說完話，等音訊播完後再恢復收音（防止回音）
+               const resumeRecordingAfterPlayback = () => {
+                 if (playerRef.current && playerRef.current.getIsPlaying()) {
+                   setTimeout(resumeRecordingAfterPlayback, 100);
+                 } else {
+                   if (recorderRef.current) recorderRef.current.unmuteInput();
+                 }
+               };
+               setTimeout(resumeRecordingAfterPlayback, 100);
+               // AI 說完話了，如果有待執行的轉接
+               if (pendingTransferRef.current) {
+                 pendingTransferRef.current = false;
+                 console.log('turnComplete - starting hold music immediately and waiting for audio');
+                 // 立即播放等候音樂（AI 說完話的瞬間就開始）
+                 startHoldMusic();
+                 // 等音訊播放完畢再執行轉接：同時用 getIsPlaying() 和備用計時器（iOS 相容）
+                 let transferred = false;
+                 const doTransfer = () => {
+                   if (transferred) return;
+                   transferred = true;
+                   console.log('Executing transfer now');
+                   handleWebTransfer();
+                 };
+                 // 備用計時器：最多等 3 秒強制執行（iOS 上 getIsPlaying 可能不可靠）
+                 const fallbackTimer = setTimeout(doTransfer, 3000);
+                 const waitForAudio = () => {
+                   if (playerRef.current && playerRef.current.getIsPlaying()) {
+                     setTimeout(waitForAudio, 200);
+                   } else {
+                     clearTimeout(fallbackTimer);
+                     doTransfer();
+                   }
+                 };
+                 setTimeout(waitForAudio, 300);
+               }
             }
             
             const inputTranscription = message.serverContent?.inputTranscription;
@@ -477,30 +565,51 @@ export default function InCall() {
       });
       
       sessionRef.current = sessionPromise;
-      sessionPromise.then((session: any) => {
-        console.log('Live API Session Connected Successfully');
-        
-        // 延遲一下再發送，確保連線完全穩定
-        setTimeout(() => {
-          if (isCallingRef.current) {
-            console.log('Sending proactive greeting...');
-            try {
-              const res = session.sendClientContent({
-                turns: [{
-                  role: 'user',
-                  parts: [{ text: "請開始對話，向客戶打招呼並詢問需求。" }]
-                }],
-                turnComplete: true
-              });
-              if (res && typeof res.catch === 'function') {
-                res.catch((e: any) => console.warn('Failed to send proactive greeting async:', e));
-              }
-            } catch (e) {
-              console.warn('Failed to send proactive greeting:', e);
-            }
+      // 等待 onopen 觸發後再播放開頭語（最多等 5 秒）
+      sessionOpenedRef.current = false;
+      const greetingText = agent?.greetingText?.trim();
+      if (greetingText) {
+        (async () => {
+          // 等待 onopen 觸發（最多 5 秒）
+          let waitMs = 0;
+          while (!sessionOpenedRef.current && waitMs < 5000) {
+            await new Promise(r => setTimeout(r, 100));
+            waitMs += 100;
           }
-        }, 800);
-      }).catch(err => {
+          if (!isMountedRef.current || !isCallingRef.current) return;
+          if (!sessionOpenedRef.current) {
+            console.warn('onopen not triggered within 5s, skipping greeting');
+            return;
+          }
+          // 再等 300ms 確保 AudioPlayer 完全就緒
+          await new Promise(r => setTimeout(r, 300));
+          if (!isMountedRef.current || !isCallingRef.current) return;
+
+          try {
+            console.log('Playing TTS greeting:', greetingText);
+            // 確保 AudioPlayer AudioContext 已 resume
+            if (playerRef.current) await playerRef.current.resume();
+            const resp = await fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: greetingText })
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              if (data.audio && playerRef.current && isMountedRef.current) {
+                playerRef.current.playBase64(data.audio);
+                console.log('TTS greeting played successfully');
+              }
+            } else {
+              const errText = await resp.text();
+              console.warn('TTS API failed:', errText);
+            }
+          } catch (e) {
+            console.warn('TTS greeting error:', e);
+          }
+        })();
+      }
+      sessionPromise.catch(err => {
         if (!isMountedRef.current || isAbortedError(err)) return;
         console.error('Live API Session Connection Failed:', err);
         if (isMountedRef.current) {
@@ -513,6 +622,64 @@ export default function InCall() {
       if (isMountedRef.current) {
         setStatus(`連接失敗: ${err.message || err}`);
       }
+    }
+  };
+
+  // 播放前端等候音樂（用 Web Audio API 產生輕柔的提示音循環）
+  // iOS 要求 AudioContext 必須在用戶手勢中建立，所以在通話開始時預先建立並保存
+  const holdAudioCtxRef = useRef<AudioContext | null>(null);
+  const holdMusicRef = useRef<{ stop: () => void } | null>(null);
+
+  const startHoldMusic = () => {
+    try {
+      // 重用已建立的 AudioContext，或建立新的
+      let ctx = holdAudioCtxRef.current;
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new AudioContext();
+        holdAudioCtxRef.current = ctx;
+      }
+      // iOS 上需要 resume
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      let stopped = false;
+      const playTone = (freq: number, startTime: number, duration: number, gain: number) => {
+        if (!ctx || ctx.state === 'closed') return;
+        const osc = ctx.createOscillator();
+        const gainNode = ctx.createGain();
+        osc.connect(gainNode);
+        gainNode.connect(ctx.destination);
+        osc.frequency.value = freq;
+        osc.type = 'sine';
+        gainNode.gain.setValueAtTime(0, startTime);
+        gainNode.gain.linearRampToValueAtTime(gain, startTime + 0.05);
+        gainNode.gain.linearRampToValueAtTime(gain, startTime + duration - 0.05);
+        gainNode.gain.linearRampToValueAtTime(0, startTime + duration);
+        osc.start(startTime);
+        osc.stop(startTime + duration);
+      };
+      const scheduleLoop = () => {
+        if (stopped || !ctx || ctx.state === 'closed') return;
+        const now = ctx.currentTime;
+        playTone(392, now + 0.05, 0.3, 0.08);       // G4
+        playTone(523, now + 0.4, 0.3, 0.08);         // C5
+        setTimeout(scheduleLoop, 1500);
+      };
+      scheduleLoop();
+      holdMusicRef.current = {
+        stop: () => {
+          stopped = true;
+        }
+      };
+    } catch (e) {
+      console.warn('Hold music failed:', e);
+    }
+  };
+
+  const stopHoldMusic = () => {
+    if (holdMusicRef.current) {
+      holdMusicRef.current.stop();
+      holdMusicRef.current = null;
     }
   };
 
@@ -535,6 +702,8 @@ export default function InCall() {
       if (recorderRef.current) recorderRef.current.stop();
       if (playerRef.current) playerRef.current.stop();
 
+      // 等候音樂已在 turnComplete 時開始，這裡不重複呼叫
+
       // 2. Initiate Twilio Conference Transfer
       const conferenceId = 'conf_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
       console.log('Initiating Web Transfer with Conference ID:', conferenceId);
@@ -556,6 +725,14 @@ export default function InCall() {
       }
 
       // 3. Connect the browser client to the same conference
+      // 如果 Twilio Device 尚未就緒，等候最多 5 秒
+      let waitAttempts = 0;
+      while (!twilioDeviceRef.current && waitAttempts < 50) {
+        await new Promise(r => setTimeout(r, 100));
+        waitAttempts++;
+      }
+      console.log(`Twilio Device status: ${twilioDeviceRef.current ? 'ready' : 'null'} (waited ${waitAttempts * 100}ms)`);
+      
       if (twilioDeviceRef.current) {
         console.log('Connecting Twilio Device to conference...');
         const call = await twilioDeviceRef.current.connect({
@@ -563,17 +740,33 @@ export default function InCall() {
         });
         twilioCallRef.current = call;
         
+        call.on('accept', () => {
+          // Twilio 連線建立，等候音樂繼續播放（需等真人實際接聽才停止）
+          console.log('Twilio conference connected, hold music continues until agent answers');
+        });
+
+        // 真人接聽時，會話就會有音訊輸入，此時停止等候音樂
+        call.on('volume', (_inputVolume: number, outputVolume: number) => {
+          if (outputVolume > 0.01) {
+            stopHoldMusic();
+          }
+        });
+
         call.on('disconnect', () => {
           console.log('Twilio Call disconnected');
+          stopHoldMusic();
           setStatus('通話結束');
         });
 
         call.on('error', (error: any) => {
           console.error('Twilio Call Error:', error);
+          stopHoldMusic();
           setErrorDetail(`語音連線錯誤: ${error.message}`);
         });
       } else {
-        throw new Error('語音設備尚未就緒，無法完成轉接');
+        // Twilio Device 尚未就緒，嘗試重新初始化
+        console.error('Twilio Device is null after waiting, attempting re-init...');
+        throw new Error('語音設備尚未就緒（請確認網路連線後再試）');
       }
 
       setStatus('真人通話中');
@@ -582,6 +775,7 @@ export default function InCall() {
     } catch (err: any) {
       if (!isMountedRef.current || isAbortedError(err)) return;
       console.error('Transfer failed:', err);
+      stopHoldMusic();
       setStatus('通話中');
       setErrorDetail(`轉接失敗: ${err.message || err}`);
     }

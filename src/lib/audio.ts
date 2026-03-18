@@ -4,6 +4,7 @@ export class AudioRecorder {
   private source: MediaStreamAudioSourceNode | null = null;
   private processor: ScriptProcessorNode | null = null;
   private onData: (base64Data: string) => void;
+  private isMuted = false; // AI 說話時用來停止收音，避免回音
 
   constructor(onData: (base64Data: string) => void) {
     this.onData = onData;
@@ -57,7 +58,9 @@ export class AudioRecorder {
           binary += String.fromCharCode(bytes[i]);
         }
         const base64 = btoa(binary);
-        this.onData(base64);
+        if (!this.isMuted) {
+          this.onData(base64);
+        }
       };
 
       this.source.connect(this.processor);
@@ -82,6 +85,14 @@ export class AudioRecorder {
       console.error('Error starting audio recorder:', err);
       throw err;
     }
+  }
+
+  muteInput() {
+    this.isMuted = true;
+  }
+
+  unmuteInput() {
+    this.isMuted = false;
   }
 
   stop() {
