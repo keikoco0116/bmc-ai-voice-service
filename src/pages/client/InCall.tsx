@@ -274,23 +274,29 @@ export default function InCall() {
       }
 
       // iOS 相容性：如果 Twilio Device 尚未就緒，在用戶手勢中重新初始化
-      if (!twilioDeviceRef.current) {
-        console.log('Twilio Device not ready, re-initializing in user gesture...');
+      if (!twilioReadyRef.current) {
+        console.log('Twilio not ready, re-initializing in user gesture...');
         try {
           const tokenRes = await fetch('/api/auth/twilio-token');
           const tokenData = await tokenRes.json();
           if (!tokenData.error) {
-            // 使用已静態 import 的 Device（避免重複動態 import）
+            // 如果 Device 已存在，先销毁再重建
+            if (twilioDeviceRef.current) {
+              try { twilioDeviceRef.current.destroy(); } catch (e) {}
+              twilioDeviceRef.current = null;
+              twilioReadyRef.current = false;
+            }
             const newDevice = new Device(tokenData.token, { logLevel: 1 });
             twilioDeviceRef.current = newDevice;
             setTwilioDevice(newDevice);
-            newDevice.register().then(() => {
-              twilioReadyRef.current = true;
-              console.log('Twilio Device re-registered in user gesture');
-            }).catch(e => console.warn('Twilio re-register failed:', e));
+            // 使用 await 確保 register() 在用戶手勢中完成
+            await newDevice.register();
+            twilioReadyRef.current = true;
+            console.log('Twilio Device re-registered in user gesture (await)');
           }
         } catch (e) {
           console.warn('Twilio re-init failed:', e);
+          // 即使失敗也繼續通話，轉接時再處理
         }
       }
 
@@ -353,7 +359,12 @@ export default function InCall() {
 5. 嚴禁在客戶要求轉接時嘗試繼續回答問題或詢問原因，必須直接執行轉接。
 `;
 
-      const systemInstruction = `${transferInstruction}\n\n${baseInstruction}\n\n【強制指令 - 嚴格遵守】：\n1. 直接開口說話，絕對不要輸出任何思考過程、動作描述（如 **Acknowledge**）或英文。\n2. 只能輸出你要說出口的「繁體中文」台詞。\n3. 保持極度簡短，1到2句話結束。\n4. 當服務完成或客戶要離開時，請務必說出「再見」或「祝您有美好的一天」來結束通話。`;
+      // 如果有設定開頭語，告訴 Gemini 不要重複說（開頭語已由 TTS 播放）
+      const greetingInstruction = greetingText
+        ? `\n\n【重要：開頭語已由系統自動播放，你絕對不可以再重複說開頭語。請靜待客戶說話，再根據客戶的需求回應。】`
+        : '';
+
+      const systemInstruction = `${transferInstruction}\n\n${baseInstruction}${greetingInstruction}\n\n【強制指令 - 嚴格遵守】：\n1. 直接開口說話，絕對不要輸出任何思考過程、動作描述（如 **Acknowledge**）或英文。\n2. 只能輸出你要說出口的「繁體中文」台詞。\n3. 保持極度簡短，1到2句話結束。\n4. 當服務完成或客戶要離開時，請務必說出「再見」或「祝您有美好的一天」來結束通話。`;
 
       // Determine voice name from agent settings
       let voiceName = "Zephyr";
@@ -565,30 +576,16 @@ export default function InCall() {
       });
       
       sessionRef.current = sessionPromise;
-      // 等待 onopen 觸發後再播放開頭語（最多等 5 秒）
+      // 優化問候語播放：立即並行呼叫 TTS API，不需等待 Gemini 連線建立
       sessionOpenedRef.current = false;
       const greetingText = agent?.greetingText?.trim();
       if (greetingText) {
         (async () => {
-          // 等待 onopen 觸發（最多 5 秒）
-          let waitMs = 0;
-          while (!sessionOpenedRef.current && waitMs < 5000) {
-            await new Promise(r => setTimeout(r, 100));
-            waitMs += 100;
-          }
-          if (!isMountedRef.current || !isCallingRef.current) return;
-          if (!sessionOpenedRef.current) {
-            console.warn('onopen not triggered within 5s, skipping greeting');
-            return;
-          }
-          // 再等 300ms 確保 AudioPlayer 完全就緒
-          await new Promise(r => setTimeout(r, 300));
-          if (!isMountedRef.current || !isCallingRef.current) return;
-
+          // 立即並行發起 TTS 請求（不等 Gemini onopen）
+          console.log('[TTS] 開始並行請求 TTS API...');
+          const ttsStartTime = Date.now();
+          let ttsAudioData: string | null = null;
           try {
-            console.log('Playing TTS greeting:', greetingText);
-            // 確保 AudioPlayer AudioContext 已 resume
-            if (playerRef.current) await playerRef.current.resume();
             const resp = await fetch('/api/tts', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -596,16 +593,39 @@ export default function InCall() {
             });
             if (resp.ok) {
               const data = await resp.json();
-              if (data.audio && playerRef.current && isMountedRef.current) {
-                playerRef.current.playBase64(data.audio);
-                console.log('TTS greeting played successfully');
-              }
+              ttsAudioData = data.audio || null;
+              console.log(`[TTS] 音訊準備完成，耗時 ${Date.now() - ttsStartTime}ms`);
             } else {
-              const errText = await resp.text();
-              console.warn('TTS API failed:', errText);
+              console.warn('[TTS] API 失敗:', await resp.text());
             }
           } catch (e) {
-            console.warn('TTS greeting error:', e);
+            console.warn('[TTS] 請求錯誤:', e);
+          }
+
+          if (!ttsAudioData) return;
+          if (!isMountedRef.current || !isCallingRef.current) return;
+
+          // 等待 onopen 觸發（最多再等 5 秒）
+          let waitMs = 0;
+          while (!sessionOpenedRef.current && waitMs < 5000) {
+            await new Promise(r => setTimeout(r, 50));
+            waitMs += 50;
+          }
+          if (!isMountedRef.current || !isCallingRef.current) return;
+          if (!sessionOpenedRef.current) {
+            console.warn('[TTS] onopen 待超時，跳過問候語');
+            return;
+          }
+
+          // onopen 已觸發，立即播放（TTS 音訊已在連線期間就緒備好）
+          try {
+            if (playerRef.current) await playerRef.current.resume();
+            if (ttsAudioData && playerRef.current && isMountedRef.current) {
+              playerRef.current.playBase64(ttsAudioData);
+              console.log(`[TTS] 問候語播放完成，總耗時 ${Date.now() - ttsStartTime}ms`);
+            }
+          } catch (e) {
+            console.warn('[TTS] 播放錯誤:', e);
           }
         })();
       }
@@ -725,15 +745,15 @@ export default function InCall() {
       }
 
       // 3. Connect the browser client to the same conference
-      // 如果 Twilio Device 尚未就緒，等候最多 5 秒
+      // 等待 Twilio Device register() 完成（twilioReadyRef），最多 5 秒
       let waitAttempts = 0;
-      while (!twilioDeviceRef.current && waitAttempts < 50) {
+      while (!twilioReadyRef.current && waitAttempts < 50) {
         await new Promise(r => setTimeout(r, 100));
         waitAttempts++;
       }
-      console.log(`Twilio Device status: ${twilioDeviceRef.current ? 'ready' : 'null'} (waited ${waitAttempts * 100}ms)`);
+      console.log(`Twilio Device ready: ${twilioReadyRef.current} (waited ${waitAttempts * 100}ms), device: ${twilioDeviceRef.current ? 'exists' : 'null'}`);
       
-      if (twilioDeviceRef.current) {
+      if (twilioDeviceRef.current && twilioReadyRef.current) {
         console.log('Connecting Twilio Device to conference...');
         const call = await twilioDeviceRef.current.connect({
           params: { confId: conferenceId }
@@ -764,9 +784,10 @@ export default function InCall() {
           setErrorDetail(`語音連線錯誤: ${error.message}`);
         });
       } else {
-        // Twilio Device 尚未就緒，嘗試重新初始化
-        console.error('Twilio Device is null after waiting, attempting re-init...');
-        throw new Error('語音設備尚未就緒（請確認網路連線後再試）');
+        // Device 不存在或 register 未完成
+        const reason = !twilioDeviceRef.current ? 'Device 未初始化' : 'register() 尚未完成';
+        console.error(`Twilio not ready after waiting: ${reason}`);
+        throw new Error(`語音設備尚未就緒（${reason}），請稍後再試`);
       }
 
       setStatus('真人通話中');
