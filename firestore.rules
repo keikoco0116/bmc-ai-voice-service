@@ -1,0 +1,192 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - email: string (required)
+    //   - role: string (required, 'admin' or 'user')
+    //
+    // Collection: config
+    // Document ID: {configId}
+    // Fields:
+    //   - didwwApiKey: string (optional)
+    //   - didwwSipDomain: string (optional)
+    //   - twilioAccountSid: string (optional)
+    //   - twilioAuthToken: string (optional)
+    //   - didwwPhoneNumber: string (optional)
+    //   - systemPrompt: string (optional)
+    //   - geminiApiKey: string (optional)
+    //
+    // Collection: agents
+    // Document ID: {agentId}
+    // Fields:
+    //   - name: string (required)
+    //   - type: string (required)
+    //   - systemPrompt: string (required)
+    //   - knowledgeBase: string (optional)
+    //   - isActive: boolean (required)
+    //   - createdAt: number (optional)
+    //   - voiceModel: string (optional)
+    //   - voiceSpeed: number (optional)
+    //   - voicePitch: number (optional)
+    //
+    // Collection: call_logs
+    // Document ID: {logId}
+    // Fields:
+    //   - time: string (required)
+    //   - phone: string (required)
+    //   - channel: string (required)
+    //   - duration: string (required)
+    //   - status: string (required)
+    //   - intent: string (required)
+    //   - agentId: string (optional)
+    //   - transcript: string (optional)
+    //   - summary: string (optional)
+    //   - estimatedCost: number (optional)
+    //   - currency: string (optional)
+    //   - createdAt: number (optional)
+    //
+    // Collection: channels
+    // Document ID: {channelId}
+    // Fields:
+    //   - name: string (required)
+    //   - phoneNumber: string (required)
+    //   - agentId: string (optional)
+    //   - webSlug: string (required)
+    //   - isActive: boolean (required)
+    //   - createdAt: number (optional)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() &&
+        (
+          (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+          request.auth.token.email == "keikoco0116@gmail.com"
+        );
+    }
+
+    function hasOnlyAllowedFields(allowedFields) {
+      return request.resource.data.keys().hasOnly(allowedFields);
+    }
+
+    function hasRequiredFields(requiredFields) {
+      return request.resource.data.keys().hasAll(requiredFields);
+    }
+
+    function isValidUser() {
+      return hasOnlyAllowedFields(['email', 'role']) &&
+             hasRequiredFields(['email', 'role']) &&
+             request.resource.data.email is string &&
+             request.resource.data.role in ['admin', 'user'];
+    }
+
+    function isValidConfig() {
+      let allowed = ['didwwApiKey', 'didwwSipDomain', 'twilioAccountSid', 'twilioAuthToken', 'didwwPhoneNumber', 'systemPrompt', 'geminiApiKey', 'sipUri', 'twilioNumber', 'companyName', 'hotlineNumber'];
+      return request.resource.data.keys().hasOnly(allowed);
+    }
+
+    function isValidAgent() {
+      return hasOnlyAllowedFields(['name', 'type', 'systemPrompt', 'knowledgeBase', 'isActive', 'createdAt', 'voiceModel', 'voiceSpeed', 'voicePitch']) &&
+             hasRequiredFields(['name', 'type', 'systemPrompt', 'isActive']) &&
+             request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() < 100 &&
+             request.resource.data.type is string &&
+             request.resource.data.systemPrompt is string &&
+             (!('knowledgeBase' in request.resource.data) || request.resource.data.knowledgeBase is string) &&
+             request.resource.data.isActive is bool &&
+             (!('createdAt' in request.resource.data) || request.resource.data.createdAt is number) &&
+             (!('voiceModel' in request.resource.data) || request.resource.data.voiceModel is string) &&
+             (!('voiceSpeed' in request.resource.data) || request.resource.data.voiceSpeed is number) &&
+             (!('voicePitch' in request.resource.data) || request.resource.data.voicePitch is number);
+    }
+
+    function isValidCallLog() {
+      return hasOnlyAllowedFields(['time', 'phone', 'channel', 'duration', 'status', 'intent', 'agentId', 'transcript', 'summary', 'createdAt', 'estimatedCost', 'currency', 'exchangeRate', 'costBreakdown']) &&
+             hasRequiredFields(['time', 'phone', 'channel', 'duration', 'status', 'intent']) &&
+             request.resource.data.time is string &&
+             request.resource.data.phone is string &&
+             request.resource.data.channel is string &&
+             request.resource.data.duration is string &&
+             request.resource.data.status is string &&
+             request.resource.data.intent is string &&
+             (!('agentId' in request.resource.data) || request.resource.data.agentId == null || request.resource.data.agentId is string || request.resource.data.agentId is number) &&
+             (!('transcript' in request.resource.data) || request.resource.data.transcript is string) &&
+             (!('summary' in request.resource.data) || request.resource.data.summary is string) &&
+             (!('estimatedCost' in request.resource.data) || request.resource.data.estimatedCost is number) &&
+             (!('currency' in request.resource.data) || request.resource.data.currency is string) &&
+             (!('exchangeRate' in request.resource.data) || request.resource.data.exchangeRate is number) &&
+             (!('costBreakdown' in request.resource.data) || request.resource.data.costBreakdown is map) &&
+             (!('createdAt' in request.resource.data) || request.resource.data.createdAt is number);
+    }
+
+    function isValidChannel() {
+      return hasOnlyAllowedFields(['name', 'phoneNumber', 'agentId', 'webSlug', 'isActive', 'createdAt']) &&
+             hasRequiredFields(['name', 'phoneNumber', 'webSlug', 'isActive']) &&
+             request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() < 100 &&
+             request.resource.data.phoneNumber is string &&
+             (!('agentId' in request.resource.data) || request.resource.data.agentId == null || request.resource.data.agentId is string || request.resource.data.agentId is number) &&
+             request.resource.data.webSlug is string &&
+             request.resource.data.isActive is bool &&
+             (!('createdAt' in request.resource.data) || request.resource.data.createdAt is number);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAdmin() && isValidUser();
+      allow update: if isAdmin() && isValidUser();
+      allow delete: if isAdmin();
+    }
+
+    match /config/{configId} {
+      allow read: if (configId == 'public') || isAuthenticated(); 
+      allow create: if isAdmin() && isValidConfig();
+      allow update: if isAdmin() && isValidConfig();
+      allow delete: if isAdmin();
+    }
+
+    match /agents/{agentId} {
+      allow read: if true; // Public read for visitors to use the AI
+      allow create: if isAdmin() && isValidAgent();
+      allow update: if isAdmin() && isValidAgent();
+      allow delete: if isAdmin();
+    }
+
+    match /call_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isValidCallLog(); // Client creates call logs (no auth required)
+      allow update: if isAdmin() && isValidCallLog();
+      allow delete: if isAdmin();
+    }
+
+    match /channels/{channelId} {
+      allow read: if true; // Public read for visitors to see available channels
+      allow create: if isAdmin() && isValidChannel();
+      allow update: if isAdmin() && isValidChannel();
+      allow delete: if isAdmin();
+    }
+  }
+}
