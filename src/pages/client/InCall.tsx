@@ -359,11 +359,10 @@ export default function InCall() {
 5. 嚴禁在客戶要求轉接時嘗試繼續回答問題或詢問原因，必須直接執行轉接。
 `;
 
-      // 如果有設定開頭語，告訴 Gemini 不要重複說（開頭語已由 TTS 播放）
-      const greetingInstruction = greetingText
+      const hasGreeting = !!(agent?.greetingText?.trim());
+      const greetingInstruction = hasGreeting
         ? `\n\n【重要：開頭語已由系統自動播放，你絕對不可以再重複說開頭語。請靜待客戶說話，再根據客戶的需求回應。】`
         : '';
-
       const systemInstruction = `${transferInstruction}\n\n${baseInstruction}${greetingInstruction}\n\n【強制指令 - 嚴格遵守】：\n1. 直接開口說話，絕對不要輸出任何思考過程、動作描述（如 **Acknowledge**）或英文。\n2. 只能輸出你要說出口的「繁體中文」台詞。\n3. 保持極度簡短，1到2句話結束。\n4. 當服務完成或客戶要離開時，請務必說出「再見」或「祝您有美好的一天」來結束通話。`;
 
       // Determine voice name from agent settings
