@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 語音客服系統 - 測試中</title>
+    <script>
+      // 解決 "TypeError: Cannot set property fetch of #<Window> which has only a getter"
+      // 這是為了防止某些套件在嘗試 polyfill fetch 時崩潰
+      (function() {
+        try {
+          var _fetch = window.fetch;
+          Object.defineProperty(window, 'fetch', {
+            get: function() { return _fetch; },
+            set: function(v) { 
+              console.warn('window.fetch was overwritten');
+              _fetch = v; 
+            },
+            configurable: true,
+            enumerable: true
+          });
+        } catch (e) {
+          // 如果無法定義 setter，嘗試直接設定為可寫入的資料屬性
+          try {
+            var originalFetch = window.fetch;
+            Object.defineProperty(window, 'fetch', {
+              value: originalFetch,
+              writable: true,
+              configurable: true,
+              enumerable: true
+            });
+          } catch (e2) {
+            console.error("Fetch fix failed:", e2);
+          }
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/bmc-ai-voice-service/assets/index-BdtoFVmG.js"></script>
+    <link rel="stylesheet" crossorigin href="/bmc-ai-voice-service/assets/index-B38JLyR4.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+
