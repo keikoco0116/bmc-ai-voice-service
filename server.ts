@@ -568,6 +568,32 @@ async function startServer() {
 
   const httpServer = createServer(app);
 
+  // ===== 方案 A：全域 Agent 快取（5 分鐘 TTL）=====
+  const agentCache = new Map<string, { data: any; expireAt: number }>();
+  const CACHE_TTL_MS = 5 * 60 * 1000; // 5 分鐘
+
+  const getCachedAgentData = async (agentId: string): Promise<any | null> => {
+    const cached = agentCache.get(agentId);
+    if (cached && Date.now() < cached.expireAt) {
+      debugLog(`✅ [Cache HIT] agent=${agentId}`);
+      return cached.data;
+    }
+    debugLog(`🔄 [Cache MISS] Fetching agent=${agentId} from Firestore...`);
+    try {
+      const agentDoc = await getDoc(doc(db, 'agents', agentId));
+      if (agentDoc.exists()) {
+        const data = agentDoc.data();
+        agentCache.set(agentId, { data, expireAt: Date.now() + CACHE_TTL_MS });
+        debugLog(`✅ [Cache SET] agent=${agentId}, expires in 5 min`);
+        return data;
+      }
+    } catch (err) {
+      console.error('Error fetching agent data:', err);
+    }
+    return null;
+  };
+  // ===== 方案 A 結束 =====
+
   // WebSocket for Twilio Stream
   const wss = new WebSocketServer({ server: httpServer, path: '/api/twilio/stream' });
   const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
@@ -593,21 +619,17 @@ async function startServer() {
 
     let baseInstruction = "你是一個專業的 AI 語音客服人員。你的語氣應該要禮貌、專業且簡潔。";
     if (agentId) {
-      try {
-        const agentDoc = await getDoc(doc(db, 'agents', agentId));
-        if (agentDoc.exists()) {
-          const data = agentDoc.data();
-          let knowledge = data.knowledgeBase || '';
-          try {
-            const parsed = JSON.parse(knowledge);
-            if (Array.isArray(parsed)) {
-              knowledge = parsed.map((src: any) => `【${src.title}】\n${src.content}`).join('\n\n');
-            }
-          } catch (e) {}
-          baseInstruction = `${data.systemPrompt}\n\n知識庫內容：\n${knowledge}`;
-        }
-      } catch (err) {
-        console.error('Error fetching agent data:', err);
+      // 方案 A：使用快取讀取 agent 設定（避免每通電話重讀 Firestore）
+      const agentData = await getCachedAgentData(agentId);
+      if (agentData) {
+        let knowledge = agentData.knowledgeBase || '';
+        try {
+          const parsed = JSON.parse(knowledge);
+          if (Array.isArray(parsed)) {
+            knowledge = parsed.map((src: any) => `【${src.title}】\n${src.content}`).join('\n\n');
+          }
+        } catch (e) {}
+        baseInstruction = `${agentData.systemPrompt}\n\n知識庫內容：\n${knowledge}`;
       }
     }
 
@@ -687,7 +709,19 @@ async function startServer() {
             inputAudioTranscription: {},
           },
           callbacks: {
-            onopen: () => console.log('Gemini Session Opened'),
+            onopen: () => {
+              console.log('Gemini Session Opened');
+              // 方案 B：移除 800ms 延遲，在 onopen 中立即發送問候指令
+              debugLog('🚀 [B] Gemini connected, sending greeting immediately (no 800ms delay)');
+              setImmediate(() => {
+                if (geminiSession) {
+                  geminiSession.sendClientContent({
+                    turns: [{ role: 'user', parts: [{ text: "請開始對話，向客戶打招呼並詢問需求。" }] }],
+                    turnComplete: true
+                  });
+                }
+              });
+            },
             onmessage: async (message) => {
               if (isTransferring) return;
               const audioData = message.serverContent?.modelTurn?.parts.find(p => p.inlineData)?.inlineData?.data;
@@ -747,14 +781,7 @@ async function startServer() {
           }
         });
         geminiSession = session;
-        setTimeout(() => {
-          if (session) {
-            session.sendClientContent({
-              turns: [{ role: 'user', parts: [{ text: "請開始對話，向客戶打招呼並詢問需求。" }] }],
-              turnComplete: true
-            });
-          }
-        }, 800);
+        // 方案 B：問候指令已移至 onopen 回調，不再需要 setTimeout 800ms
       } catch (err) {
         console.error('Failed to connect to Gemini:', err);
       }
